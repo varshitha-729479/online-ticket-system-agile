@@ -1,0 +1,150 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_IMAGE = "varshitha729479/ticket-cancellation:latest"
+    }
+    
+    stages {
+        stage('Clone Repository') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/varshitha-729479/online-ticket-system-agile.git'
+            }
+        }
+        
+        stage('Build & Run Tests') {
+            steps {
+                bat 'mvn clean test'
+            }
+            post {
+                always {
+                    junit 'target/surefire-reports/*.xml'
+                }
+            }
+        }
+        
+        stage('Package Application') {
+            steps {
+                bat 'mvn package -DskipTests'
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                bat "docker build -t %DOCKER_IMAGE% ."
+            }
+        }
+        
+        stage('Push to DockerHub') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    bat """
+                        docker login -u %DOCKER_USER% -p %DOCKER_PASS%
+                        docker push %DOCKER_IMAGE%
+                    """
+                }
+            }
+        }
+        
+        stage('Setup Kubernetes') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+                    bat '''
+                        REM Create .kube directory
+                        if not exist "%WORKSPACE%\\.kube" mkdir "%WORKSPACE%\\.kube"
+                        
+                        REM Copy kubeconfig from secret file
+                        copy "%KUBECONFIG_FILE%" "%WORKSPACE%\\.kube\\config"
+                        
+                        REM Set KUBECONFIG environment variable
+                        set KUBECONFIG=%WORKSPACE%\\.kube\\config
+                        
+                        REM Verify Kubernetes connection
+                        kubectl config current-context
+                        kubectl get nodes
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to Kubernetes') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+                    bat '''
+                        set KUBECONFIG=%WORKSPACE%\\.kube\\config
+                        
+                        REM Delete existing deployment (if any)
+                        kubectl delete deployment ticket-cancellation-deployment --ignore-not-found=true
+                        kubectl delete service ticket-cancellation-service --ignore-not-found=true
+                        
+                        REM Deploy ticket cancellation application
+                        kubectl apply -f deployment.yaml --validate=false
+                        
+                        REM Wait for rollout to complete
+                        kubectl rollout status deployment ticket-cancellation-deployment --timeout=5m
+                        
+                        REM Show deployed resources
+                        kubectl get pods -l app=ticket-cancellation
+                        kubectl get svc ticket-cancellation-service
+                    '''
+                }
+            }
+        }
+        
+        stage('Verify Deployment') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+                    bat '''
+                        set KUBECONFIG=%WORKSPACE%\\.kube\\config
+                        
+                        REM Wait for pods to be ready
+                        kubectl wait --for=condition=ready pod -l app=ticket-cancellation --timeout=60s
+                        
+                        REM Get pod name and check logs
+                        for /f "tokens=1" %%i in ('kubectl get pod -l app=ticket-cancellation -o jsonpath="{.items[0].metadata.name}"') do set POD=%%i
+                        echo Checking logs for pod: %POD%
+                        kubectl logs %POD% --tail=15
+                        
+                        REM Test application via port forwarding
+                        start /B kubectl port-forward service/ticket-cancellation-service 8080:80
+                        timeout /t 5 /nobreak
+                        
+                        REM Health check - simple curl to see if app responds
+                        curl -f http://localhost:8080
+                        if %ERRORLEVEL% NEQ 0 exit /b 1
+                        
+                        echo ================================================
+                        echo Ticket Cancellation Application is running!
+                        echo ================================================
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo '=================================================='
+            echo '✅ Pipeline executed successfully!'
+            echo '=================================================='
+            echo 'Application is deployed on Minikube'
+            echo 'Access it using: kubectl port-forward service/ticket-cancellation-service 8080:80'
+            echo 'Then open browser at: http://localhost:8080'
+            echo '=================================================='
+        }
+        failure {
+            echo '❌ Pipeline failed!'
+            echo 'Check the logs above for detailed error messages'
+        }
+        always {
+            script {
+                bat 'taskkill /F /IM kubectl.exe 2>nul & exit 0'
+            }
+        }
+    }
+}
